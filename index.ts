@@ -61,7 +61,7 @@ watcher
           TranscriptionJobName: `${filename.replace(
             /\s+/g,
             "-"
-          )}-transcription-job`,
+          )}-transcription-job-${Date.now().toString()}`,
           LanguageCode: "es-US",
           MediaFormat: "mp3",
           Media: {
@@ -69,6 +69,10 @@ watcher
           },
           OutputBucketName: bucketName,
           Subtitles: { Formats: ["srt"] },
+          Settings: {
+            ShowSpeakerLabels: true,
+            MaxSpeakerLabels: 2,
+          },
         });
       })
       .saveToFile(`assets/${mp3Filename}`);
@@ -133,6 +137,10 @@ type TranscriptionJob = {
   OutputBucketName: string;
   Subtitles: {
     Formats: string[];
+  };
+  Settings: {
+    ShowSpeakerLabels: boolean;
+    MaxSpeakerLabels: number;
   };
 };
 
