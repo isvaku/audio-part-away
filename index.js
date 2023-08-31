@@ -38,26 +38,67 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
 var _a, _b, _c, _d;
 Object.defineProperty(exports, "__esModule", { value: true });
 var chokidar = require("chokidar");
-var fluent_ffmpeg_1 = require("fluent-ffmpeg");
+// @ts-ignore
+var ffmpeg = require("fluent-ffmpeg");
 var fs_1 = require("fs");
-var fs_2 = require("fs");
 require("dotenv/config");
 var client_s3_1 = require("@aws-sdk/client-s3");
+var client_transcribe_1 = require("@aws-sdk/client-transcribe");
+var docx_1 = require("docx");
 var validFormats = ["mp4", "mkv", "mov"];
 var accessKeyId = (_a = process.env.AWS_ACCESS_KEY) !== null && _a !== void 0 ? _a : "";
 var secretAccessKey = (_b = process.env.AWS_SECRET_KEY) !== null && _b !== void 0 ? _b : "";
 var bucketName = (_c = process.env.AWS_BUCKET_NAME) !== null && _c !== void 0 ? _c : "";
 var region = (_d = process.env.AWS_BUCKET_REGION) !== null && _d !== void 0 ? _d : "";
+var transcribeClient = new client_transcribe_1.TranscribeClient({
+    region: region,
+    credentials: { accessKeyId: accessKeyId, secretAccessKey: secretAccessKey },
+});
 var watcher = chokidar.watch("./assets", {
     ignored: /(^|[\/\\])\../,
     persistent: true,
     alwaysStat: false,
     ignoreInitial: true,
 });
+var regex = /\n\s*\n/g;
+var table = new docx_1.Table({
+    rows: [
+        new docx_1.TableRow({
+            children: [
+                new docx_1.TableCell({
+                    children: [new docx_1.Paragraph("Hello")],
+                }),
+                new docx_1.TableCell({
+                    children: [],
+                }),
+            ],
+        }),
+        new docx_1.TableRow({
+            children: [
+                new docx_1.TableCell({
+                    children: [],
+                }),
+                new docx_1.TableCell({
+                    children: [new docx_1.Paragraph("World")],
+                }),
+            ],
+        }),
+    ],
+});
+var doc = new docx_1.Document({
+    sections: [
+        {
+            children: [table],
+        },
+    ],
+});
+docx_1.Packer.toBuffer(doc).then(function (buffer) {
+    (0, fs_1.writeFileSync)("My Document.docx", buffer);
+});
 watcher
     .on("ready", function () { return console.log("Initial scan complete. Ready for changes"); })
     .on("add", function (path) { return __awaiter(void 0, void 0, void 0, function () {
-    var mp3Filename;
+    var baseFolder, filename, mp3Filename;
     return __generator(this, function (_a) {
         switch (_a.label) {
             case 0:
@@ -66,11 +107,13 @@ watcher
                     console.error("Not a valid video format");
                     return [2 /*return*/];
                 }
-                mp3Filename = path.split("\\")[1].split(".")[0] + ".mp3";
+                baseFolder = path.split("\\")[0];
+                filename = path.split("\\")[1].split(".")[0];
+                mp3Filename = "".concat(filename, ".mp3");
                 return [4 /*yield*/, waitForFileAvailable(path)];
             case 1:
                 _a.sent();
-                (0, fluent_ffmpeg_1.default)(path)
+                ffmpeg(path)
                     .addOption("-q:a", "0")
                     .addOption("-map", "a")
                     .on("start", function (commandLine) {
@@ -81,17 +124,24 @@ watcher
                 })
                     .on("end", function (stdout, stderr) {
                     return __awaiter(this, void 0, void 0, function () {
+                        var transcriptionJob;
                         return __generator(this, function (_a) {
                             switch (_a.label) {
-                                case 0: 
-                                // TODO: Upload to S3
-                                //S3Client;
-                                return [4 /*yield*/, uploadFileToS3(path, mp3Filename)];
+                                case 0: return [4 /*yield*/, uploadFileToS3("".concat(baseFolder, "/").concat(mp3Filename), mp3Filename)];
                                 case 1:
-                                    // TODO: Upload to S3
-                                    //S3Client;
                                     _a.sent();
-                                    console.log("Processing finished !");
+                                    return [4 /*yield*/, createTranscriptionJob({
+                                            TranscriptionJobName: "".concat(filename.replace(/\s+/g, "-"), "-transcription-job-").concat(Date.now().toString()),
+                                            LanguageCode: "es-US",
+                                            MediaFormat: "mp3",
+                                            Media: {
+                                                MediaFileUri: "s3://audio-transcription-bucket-j/".concat(mp3Filename),
+                                            },
+                                            OutputBucketName: bucketName,
+                                            Subtitles: { Formats: ["srt"] },
+                                        })];
+                                case 2:
+                                    transcriptionJob = _a.sent();
                                     return [2 /*return*/];
                             }
                         });
@@ -107,10 +157,10 @@ function waitForFileAvailable(filePath) {
         var checkInterval = setInterval(function () {
             try {
                 // Try to open the file in write mode. If it succeeds, the file is no longer in use.
-                (0, fs_2.open)(filePath, "r", function (err, fd) {
+                (0, fs_1.open)(filePath, "r", function (err, fd) {
                     if (!err) {
                         clearInterval(checkInterval);
-                        (0, fs_2.close)(fd, function (err) {
+                        (0, fs_1.close)(fd, function (err) {
                             if (err)
                                 throw err;
                         });
@@ -135,7 +185,7 @@ function uploadFileToS3(path, filename) {
                         region: region,
                         credentials: { accessKeyId: accessKeyId, secretAccessKey: secretAccessKey },
                     });
-                    fileContent = fs_1.default.readFileSync(path);
+                    fileContent = (0, fs_1.readFileSync)(path);
                     params = {
                         Bucket: bucketName,
                         Key: filename,
@@ -149,7 +199,7 @@ function uploadFileToS3(path, filename) {
                 case 2:
                     response = _a.sent();
                     console.log("File uploaded successfully:", response);
-                    return [3 /*break*/, 4];
+                    return [2 /*return*/, response];
                 case 3:
                     err_1 = _a.sent();
                     console.error("Error uploading file:", err_1);
@@ -157,5 +207,37 @@ function uploadFileToS3(path, filename) {
                 case 4: return [2 /*return*/];
             }
         });
+    });
+}
+function createTranscriptionJob(params) {
+    return __awaiter(this, void 0, void 0, function () {
+        var data, err_2;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0:
+                    _a.trys.push([0, 2, , 3]);
+                    return [4 /*yield*/, transcribeClient.send(new client_transcribe_1.StartTranscriptionJobCommand(params))];
+                case 1:
+                    data = _a.sent();
+                    console.log("Success - put", data);
+                    return [2 /*return*/, data]; // For unit tests.
+                case 2:
+                    err_2 = _a.sent();
+                    console.log("Error", err_2);
+                    return [3 /*break*/, 3];
+                case 3: return [2 /*return*/];
+            }
+        });
+    });
+}
+// TODO: Create XLSX from result
+function createXLSX(data) {
+    console.log(data);
+}
+function curate(data) {
+    var rawData = data.split(regex);
+    return rawData.map(function (item) {
+        var _a = item.split("\n"), id = _a[0], time = _a[1], rest = _a.slice(2);
+        return { id: id, time: time, text: rest.join("\n") };
     });
 }
