@@ -185,17 +185,23 @@ async function createTranscriptionJob(
 // TODO: Create XLSX from result
 function createDOCX(data: string) {
   const curatedData = curateData(data);
-  const rows = curatedData.map(({ id, time, text }) => {
+  const rows = curatedData.map(({ time, text }) => {
     return new TableRow({
       children: [
-        new TableCell({
-          children: [new Paragraph(id)],
-        }),
         new TableCell({
           children: [new Paragraph(time)],
         }),
         new TableCell({
+          children: [new Paragraph("")],
+        }),
+        new TableCell({
           children: [new Paragraph(text)],
+        }),
+        new TableCell({
+          children: [new Paragraph("")],
+        }),
+        new TableCell({
+          children: [new Paragraph("")],
         }),
       ],
     });
@@ -204,13 +210,19 @@ function createDOCX(data: string) {
     new TableRow({
       children: [
         new TableCell({
-          children: [new Paragraph("id")],
+          children: [new Paragraph("Minuto")],
         }),
         new TableCell({
-          children: [new Paragraph("time")],
+          children: [new Paragraph("Terapeuta / Paciente")],
         }),
         new TableCell({
-          children: [new Paragraph("text")],
+          children: [new Paragraph("Diálogo")],
+        }),
+        new TableCell({
+          children: [new Paragraph("Auto observación")],
+        }),
+        new TableCell({
+          children: [new Paragraph("Retroalimentación")],
         }),
       ],
       tableHeader: true,
@@ -235,8 +247,8 @@ function createDOCX(data: string) {
 function curateData(data: string) {
   const rawData = data.split(regex);
   return rawData.map((item) => {
-    const [id, time, ...rest] = item.split("\n");
-    return { id, time, text: rest.join("\n") };
+    const [, time, ...rest] = item.split("\n");
+    return { time, text: rest.join("\n") };
   });
 }
 
