@@ -1,26 +1,45 @@
 import * as chokidar from "chokidar";
-import ffmpeg from "fluent-ffmpeg";
-import fs from "fs";
-import { open, close } from "fs";
+// @ts-ignore
+import ffmpeg = require("fluent-ffmpeg");
+import {
+  open,
+  close,
+  readFileSync,
+  writeFileSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+} from "fs";
 
 import "dotenv/config";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
+import {
+  GetTranscriptionJobCommand,
   StartTranscriptionJobCommand,
+  StartTranscriptionJobCommandInput,
   TranscribeClient,
 } from "@aws-sdk/client-transcribe";
 
+import { Document, Packer, Paragraph, Table, TableCell, TableRow } from "docx";
+import { Readable } from "stream";
+
 const validFormats = ["mp4", "mkv", "mov"];
 
-const accessKeyId = process.env.AWS_ACCESS_KEY ?? "";
-const secretAccessKey = process.env.AWS_SECRET_KEY ?? "";
+const AWSCredentials = {
+  region: process.env.AWS_BUCKET_REGION ?? "",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY ?? "",
+    secretAccessKey: process.env.AWS_SECRET_KEY ?? "",
+  },
+};
 const bucketName = process.env.AWS_BUCKET_NAME ?? "";
-const region = process.env.AWS_BUCKET_REGION ?? "";
 
-const transcribeClient = new TranscribeClient({
-  region,
-  credentials: { accessKeyId, secretAccessKey },
-});
+const s3Client = new S3Client(AWSCredentials);
+const transcribeClient = new TranscribeClient(AWSCredentials);
 
 const watcher = chokidar.watch("./assets", {
   ignored: /(^|[\/\\])\../, // ignore dotfiles
@@ -28,6 +47,8 @@ const watcher = chokidar.watch("./assets", {
   alwaysStat: false,
   ignoreInitial: true,
 });
+
+const regex = /\n\s*\n/g;
 
 watcher
   .on("ready", () => console.log("Initial scan complete. Ready for changes"))
@@ -57,22 +78,41 @@ watcher
       )
       .on("end", async function (stdout: any, stderr: any) {
         await uploadFileToS3(`${baseFolder}/${mp3Filename}`, mp3Filename);
-        await createTranscriptionJob({
-          TranscriptionJobName: `${filename.replace(
-            /\s+/g,
-            "-"
-          )}-transcription-job-${Date.now().toString()}`,
+        const parsedFilename = filename.replace(/\s+/g, "-");
+        const currentDate = Date.now().toString();
+        const transcriptionKey = `transcripts/${parsedFilename}-transcription-${currentDate}/`;
+        const transcriptionJob = await createTranscriptionJob({
+          TranscriptionJobName: `${parsedFilename}-transcription-job-${currentDate}`,
           LanguageCode: "es-US",
           MediaFormat: "mp3",
           Media: {
-            MediaFileUri: `s3://audio-transcription-bucket-j/${mp3Filename}`,
+            MediaFileUri: `s3://${bucketName}/audiofiles/${mp3Filename}`,
           },
           OutputBucketName: bucketName,
+          OutputKey: transcriptionKey,
           Subtitles: { Formats: ["srt"] },
-          Settings: {
-            ShowSpeakerLabels: true,
-            MaxSpeakerLabels: 2,
-          },
+        });
+
+        const transcriptionFilename = await getTranscriptionJobFilename(
+          transcriptionJob?.TranscriptionJob?.TranscriptionJobName as string
+        );
+
+        const localTranscriptionPath = (await getS3Object(
+          transcriptionFilename,
+          transcriptionKey
+        )) as string;
+        await waitForFileAvailable(localTranscriptionPath);
+        const transcription = readFileSync(localTranscriptionPath).toString();
+
+        const doc = createDOCX(transcription);
+
+        Packer.toBuffer(doc).then((buffer: string | NodeJS.ArrayBufferView) => {
+          const docPath = "./assets/docs";
+          const docFilePath = `${docPath}/transcript-${filename}-${currentDate}.docx`;
+          if (!existsSync(docPath)) {
+            mkdirSync(docPath, { recursive: true });
+          }
+          writeFileSync(docFilePath, buffer);
         });
       })
       .saveToFile(`assets/${mp3Filename}`);
@@ -101,57 +141,170 @@ function waitForFileAvailable(filePath: string) {
 }
 
 async function uploadFileToS3(path: string, filename: string) {
-  const s3Client = new S3Client({
-    region,
-    credentials: { accessKeyId, secretAccessKey },
-  });
-
-  // Lee el contenido del archivo
-  const fileContent = fs.readFileSync(path);
-
-  // Configura el comando para subir el archivo
+  const fileContent = readFileSync(path);
   const params = {
     Bucket: bucketName,
-    Key: filename,
+    Key: `audiofiles/${filename}`,
     Body: fileContent,
   };
 
-  // Sube el archivo a S3
   try {
     const command = new PutObjectCommand(params);
     const response = await s3Client.send(command);
-    console.log("File uploaded successfully:", response);
+    if (response.$metadata.httpStatusCode === 200) {
+      console.log(`File ${filename} uploaded successfully:`);
+    } else {
+      console.error("Error uploading file:", response);
+    }
     return response;
   } catch (err) {
     console.error("Error uploading file:", err);
   }
 }
 
-type TranscriptionJob = {
-  TranscriptionJobName: string;
-  LanguageCode: string;
-  MediaFormat: string;
-  Media: {
-    MediaFileUri: string;
-  };
-  OutputBucketName: string;
-  Subtitles: {
-    Formats: string[];
-  };
-  Settings: {
-    ShowSpeakerLabels: boolean;
-    MaxSpeakerLabels: number;
-  };
-};
-
-async function createTranscriptionJob(params: TranscriptionJob) {
+async function createTranscriptionJob(
+  params: StartTranscriptionJobCommandInput
+) {
   try {
-    const data = await transcribeClient.send(
+    const transcriptionJobCommand = await transcribeClient.send(
       new StartTranscriptionJobCommand(params)
     );
-    console.log("Success - put", data);
-    return data; // For unit tests.
+    if (transcriptionJobCommand.$metadata.httpStatusCode === 200) {
+      console.log(
+        `Transcription job created: ${transcriptionJobCommand.TranscriptionJob?.TranscriptionJobName}`
+      );
+    } else {
+      console.error("Error on transcription job: ", transcriptionJobCommand);
+    }
+    return transcriptionJobCommand;
   } catch (err) {
-    console.log("Error", err);
+    console.log("Error creating transcription job: ", err);
+  }
+}
+
+// TODO: Create XLSX from result
+function createDOCX(data: string) {
+  const curatedData = curateData(data);
+  const rows = curatedData.map(({ id, time, text }) => {
+    return new TableRow({
+      children: [
+        new TableCell({
+          children: [new Paragraph(id)],
+        }),
+        new TableCell({
+          children: [new Paragraph(time)],
+        }),
+        new TableCell({
+          children: [new Paragraph(text)],
+        }),
+      ],
+    });
+  });
+  rows.unshift(
+    new TableRow({
+      children: [
+        new TableCell({
+          children: [new Paragraph("id")],
+        }),
+        new TableCell({
+          children: [new Paragraph("time")],
+        }),
+        new TableCell({
+          children: [new Paragraph("text")],
+        }),
+      ],
+      tableHeader: true,
+    })
+  );
+
+  const table = new Table({
+    rows,
+  });
+
+  const doc = new Document({
+    sections: [
+      {
+        children: [table],
+      },
+    ],
+  });
+
+  return doc;
+}
+
+function curateData(data: string) {
+  const rawData = data.split(regex);
+  return rawData.map((item) => {
+    const [id, time, ...rest] = item.split("\n");
+    return { id, time, text: rest.join("\n") };
+  });
+}
+
+function getTranscriptionJobFilename(transcriptionJobName: string) {
+  return new Promise<string>(function (resolve, reject) {
+    const interval = setInterval(async () => {
+      try {
+        const transcriptionJobCommand = await transcribeClient.send(
+          new GetTranscriptionJobCommand({
+            TranscriptionJobName: transcriptionJobName,
+          })
+        );
+        if (
+          transcriptionJobCommand.TranscriptionJob?.TranscriptionJobStatus ===
+          "COMPLETED"
+        ) {
+          const transcriptFileUri =
+            transcriptionJobCommand.TranscriptionJob?.Subtitles?.SubtitleFileUris?.[0]
+              ?.split("/")
+              .pop() as string;
+          console.log(
+            `Transcription job: ${transcriptionJobName} finished successfully, transcript Key: ${transcriptFileUri}`
+          );
+          resolve(transcriptFileUri);
+          clearInterval(interval);
+        }
+
+        if (
+          transcriptionJobCommand.TranscriptionJob?.TranscriptionJobStatus ===
+          "FAILED"
+        ) {
+          console.error(
+            `Transcription job: ${transcriptionJobName} failed with reason: ${transcriptionJobCommand.TranscriptionJob?.FailureReason}`
+          );
+          reject(null);
+          clearInterval(interval);
+        }
+      } catch (err) {
+        console.log("Error consulting transcription job status: ", err);
+      }
+    }, 5000);
+  });
+}
+
+async function getS3Object(filename: string, objectKey: string) {
+  const command = new GetObjectCommand({
+    Bucket: bucketName,
+    Key: `${objectKey}${filename}`,
+  });
+
+  const path = "./assets/transcripts";
+  const filePath = `${path}/${filename}`;
+
+  try {
+    if (!existsSync(path)) {
+      mkdirSync(path, { recursive: true });
+    }
+    const response = await s3Client.send(command);
+    if (response.Body instanceof Readable) {
+      let readableStream: Readable = response.Body as Readable;
+      readableStream.pipe(createWriteStream(filePath));
+    } else {
+      console.error(`GetObjectCommand should return an
+        internal.Readable object. Maybe the code is
+        running in the Browser?`);
+    }
+    return filePath;
+  } catch (err) {
+    console.error(err);
   }
 }
